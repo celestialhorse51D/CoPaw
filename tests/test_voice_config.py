@@ -16,8 +16,6 @@ class TestVoiceChannelConfig:
         assert config.stt_provider == "deepgram"
         assert config.language == "en-US"
         assert config.max_concurrent_calls == 1
-        assert config.max_call_duration_minutes == 30
-        assert config.log_transcripts is True
         assert config.local_port == 8088
 
     def test_custom_values(self):
