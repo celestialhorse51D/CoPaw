@@ -373,32 +373,80 @@ Set-Content -Path $cmdWrapperPath -Value $cmdWrapperContent -Encoding UTF8
 Write-Info "CMD wrapper created at $cmdWrapperPath"
 
 # ──Step 5: Update PATH via User Environment Variable ────────────────────────
-$currentUserPath = $env:Path
-if ($currentUserPath -notlike "*$CopawBin*") {
-    $fullPath = "$CopawBin;$currentUserPath"
+$targetPath = $CopawBin
+$registryPath = "HKCU:\Environment"
+$registryName = "Path"
+
+# 1. 安全获取当前的 User PATH (直接从注册表读取，避免污染 Machine PATH)
+try {
+    $currentUserPath = (Get-ItemProperty -Path $registryPath -Name $registryName -ErrorAction SilentlyContinue).Path
+    if (-not $currentUserPath) { $currentUserPath = "" }
+} catch {
+    # 如果连读都失败（极罕见），则从头开始
+    $currentUserPath = ""
+    Write-Debug "Could not read User Path from registry, starting fresh."
+}
+
+# 2. 精确检查是否已存在 (解决前缀匹配误判)
+# 分割路径并去除空格
+$pathArray = $currentUserPath -split ';' | ForEach-Object { $_.Trim() }
+$isAlreadyAdded = $pathArray -contains $targetPath
+
+if (-not $isAlreadyAdded) {
+    # 构建新的 User PATH 字符串
+    if ($currentUserPath) {
+        $newUserPath = "$targetPath;$currentUserPath"
+    } else {
+        $newUserPath = $targetPath
+    }
+
+    # 3. 核心修复：使用 SetItemProperty 代替 [Environment]::SetEnvironmentVariable
+    #    这是原生 cmdlet，在 Constrained Language Mode 下通常可用
     try {
-        # 尝试使用安全方法更新PATH
-        [Environment]::SetEnvironmentVariable("Path", $fullPath, "User")
-        $env:Path = $fullPath
-        Write-Info "Added $CopawBin to user PATH"
+        # 确保注册表路径存在 (HKCU:\Environment 通常默认存在，但为了健壮性检查一下)
+        if (-not (Test-Path $registryPath)) {
+            # 这种情况极少见，但如果发生，尝试创建（通常需要权限，若失败则进入 catch）
+            New-Item -Path $registryPath -Force | Out-Null
+        }
+
+        # 写入注册表
+        SetItemProperty -Path $registryPath -Name $registryName -Value $newUserPath
+
+        # 更新当前进程的环境变量，使当前终端立即生效
+        $env:Path = "$targetPath;$env:Path"
+
+        Write-Info "Successfully added $targetPath to User PATH (via Registry)"
+
     } catch {
-        # ⚠️ 关键修复：受限语言模式下无法使用SetEnvironmentVariable
-        Write-Host "[WARNING] Constrained Language Mode detected - cannot update PATH automatically"
-        Write-Host "Please manually add the following paths to your system PATH:"
-        Write-Host "  - $CopawBin"
+        # 如果连 SetItemProperty 都失败（例如注册表被组策略完全锁定）
+        $errorMsg = $_.Exception.Message
+
         Write-Host ""
-        Write-Host "To do this:"
-        Write-Host "  1. Press Win+R, type 'sysdm.cpl' and press Enter"
-        Write-Host "  2. Go to Advanced > Environment Variables"
-        Write-Host "  3. Under 'System variables', select 'Path' and click 'Edit'"
-        Write-Host "  4. Click 'New' and add: $CopawBin"
-        Write-Host "  5. Click OK to save changes"
-        Write-Host "  6. Restart your terminal to apply changes"
+        Write-Host "[CRITICAL WARNING] Automatic PATH update failed." -ForegroundColor Red
+        Write-Host "   Reason: $errorMsg"
+        Write-Host "   Context: Your system policy strictly blocks environment modifications."
         Write-Host ""
-        Write-Host "After restarting, run 'copaw --version' to verify installation"
+        Write-Host "ACTION REQUIRED: You must manually add the path to use CoPaw."
+        Write-Host "   Target Path: $targetPath"
+        Write-Host ""
+        Write-Host "Manual Steps (User Variables):"
+        Write-Host "   1. Press Win+R, type 'sysdm.cpl' and press Enter"
+        Write-Host "   2. Go to [Advanced] > [Environment Variables...]"
+        Write-Host "   3. In the TOP section ('User variables'), select 'Path' > [Edit]"
+        Write-Host "      (If 'Path' doesn't exist in User variables, click [New] and name it 'Path')"
+        Write-Host "   4. Click [New] and paste: $targetPath"
+        Write-Host "   5. Click [OK] everywhere to save."
+        Write-Host "   6. CLOSE and REOPEN your terminal."
+        Write-Host ""
+
+        # 即使注册表写入失败，也尝试更新当前会话以便用户测试（如果不报错的话）
+        # 注意：如果策略极严，这行也可能无效，但尝试一下无害
+        try {
+            $env:Path = "$targetPath;$env:Path"
+        } catch {}
     }
 } else {
-    Write-Info "$CopawBin already in PATH"
+    Write-Info "$targetPath is already in your User PATH"
 }
 
 # ── Done ──────────────────────────────────────────────────────────────────────

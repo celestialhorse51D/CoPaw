@@ -348,19 +348,41 @@ for %%I in ("%ARG_SOURCE_DIR%") do set "ARG_SOURCE_DIR=%%~fI"
 echo [copaw] Installing CoPaw from local source: %ARG_SOURCE_DIR%
 call :prepare_console "%ARG_SOURCE_DIR%"
 echo [copaw] Installing package from source...
-rem === Validate user inputs ===
-if "%ARG_SOURCE_DIR%" == "" (set "ARG_SOURCE_DIR=.")
-if "%EXTRAS_SUFFIX%" == "" (set "EXTRAS_SUFFIX=")
 
-rem Check for double quotes (critical security check)
-if "%ARG_SOURCE_DIR:"=""%" neq "%ARG_SOURCE_DIR%" (
-    echo Error: ARG_SOURCE_DIR cannot contain double quotes (^")
+rem === Secure Input Validation (Prevents Argument Injection) ===
+rem 1. Ensure non-empty
+if “%ARG_SOURCE_DIR%” == ‘’ set “ARG_SOURCE_DIR=.”
+if “%EXTRAS_SUFFIX%” == ‘’ set “EXTRAS_SUFFIX=”
+
+rem 2. Define invalid character set (double quotes, pipe, logical AND, redirection, brackets, percent sign, caret)
+rem These characters can break command structure or inject new parameters
+set “INVALID_CHARS=\”|&<>()%%^"
+
+rem 3. Validate ARG_SOURCE_DIR
+rem Logic: If the variable contains any invalid characters, findstr will match successfully (errorlevel 0)
+echo %ARG_SOURCE_DIR% | findstr /R "[\"|&<>()%%^]" >nul 2>&1
+if not errorlevel 1 (
+    echo [ERROR] Security Alert: ARG_SOURCE_DIR contains invalid characters.
+    echo [ERROR] Detected unsafe input: %ARG_SOURCE_DIR%
+    echo [ERROR] Installation aborted to prevent argument injection.
+    call :cleanup_console "%ARG_SOURCE_DIR%"
     exit /b 1
 )
-if "%EXTRAS_SUFFIX:"=""%" neq "%EXTRAS_SUFFIX%" (
-    echo Error: EXTRAS_SUFFIX cannot contain double quotes (^")
+
+rem 4. Validate EXTRAS_SUFFIX (typically formatted as [dev,test])
+rem Whitelist policy: Only letters, digits, commas, square brackets, underscores, and hyphens are permitted
+rem Logic: If any non-whitelisted character is present, findstr succeeds
+echo %EXTRAS_SUFFIX% | findstr /R "[^a-zA-Z0-9_,\-\[\]]" >nul 2>&1
+if not errorlevel 1 (
+    echo [ERROR] Security Alert: EXTRAS_SUFFIX contains invalid characters.
+    echo [ERROR] Detected unsafe input: %EXTRAS_SUFFIX%
+    echo [ERROR] Only alphanumeric, commas, underscores, hyphens, and brackets are allowed.
+    call :cleanup_console "%ARG_SOURCE_DIR%"
     exit /b 1
 )
+rem === End Security Validation ===
+
+rem The input has now been verified as safe and can proceed with installation.
 uv pip install "%ARG_SOURCE_DIR%%EXTRAS_SUFFIX%" --python "%VENV_PYTHON%" --prerelease=allow
 set "_INST_ERR=%errorlevel%"
 call :cleanup_console "%ARG_SOURCE_DIR%"
@@ -399,8 +421,28 @@ goto :install_verify
 
 :install_from_pypi
 set "_PACKAGE=copaw"
-if defined ARG_VERSION set "_PACKAGE=copaw==%ARG_VERSION%"
+
+rem === Secure Validation for ARG_VERSION ===
+if defined ARG_VERSION (
+    rem Version number whitelist: Only permits numbers, letters, periods, comparison symbols (=<>!), hyphens, and tilde characters
+    rem Prohibits spaces, quotation marks, slashes, and other characters potentially used for --index-url injection
+    echo %ARG_VERSION% | findstr /R "[^a-zA-Z0-9\.=<>\!\-~]" >nul 2>&1
+    if not errorlevel 1 (
+        echo [ERROR] Security Alert: ARG_VERSION contains invalid characters.
+        echo [ERROR] Detected unsafe input: %ARG_VERSION%
+        echo [ERROR] Installation aborted.
+        exit /b 1
+    )
+    set "_PACKAGE=copaw%ARG_VERSION%"
+)
+rem === End Version Validation ===
+
 echo [copaw] Installing %_PACKAGE%%EXTRAS_SUFFIX% from PyPI...
+rem Note: It is also recommended to validate EXTRAS_SUFFIX here. Although it may be undefined in the local scope above,
+rem for safety, if ARG_EXTRAS is defined globally, it is best to reuse the validation logic from above or ensure its source is secure.
+rem Assume EXTRAS_SUFFIX is generated here based on the previously validated ARG_EXTRAS, or is empty.
+rem If ARG_EXTRAS is passed globally, it is recommended to validate it uniformly at the beginning of the script.
+
 uv pip install "%_PACKAGE%%EXTRAS_SUFFIX%" --python "%VENV_PYTHON%" --prerelease=allow --quiet
 if errorlevel 1 (
     echo [copaw] ERROR: Installation failed
