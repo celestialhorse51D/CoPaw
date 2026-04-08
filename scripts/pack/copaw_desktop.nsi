@@ -43,20 +43,28 @@ RequestExecutionLevel user
 ; The bootstrapper (~1.8 MB) supports per-user install — no admin needed.
 ; ---------------------------------------------------------------------------
 Function _DetectWebView2
-  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
-  ${If} $0 != ""
-  ${AndIf} $0 != "0.0.0.0"
-    StrCpy $1 "1"
-    Return
-  ${EndIf}
-
+  ; Check HKLM 64-bit registry view
+  SetRegView 64
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
   ${If} $0 != ""
   ${AndIf} $0 != "0.0.0.0"
+    SetRegView lastused
     StrCpy $1 "1"
     Return
   ${EndIf}
 
+  ; Check HKLM 32-bit registry view
+  SetRegView 32
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    SetRegView lastused
+    StrCpy $1 "1"
+    Return
+  ${EndIf}
+  SetRegView lastused
+
+  ; Check HKCU (not affected by registry redirection)
   ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
   ${If} $0 != ""
   ${AndIf} $0 != "0.0.0.0"
@@ -81,11 +89,21 @@ Section "-WebView2"
   ${If} $0 == "success"
     DetailPrint "Installing WebView2 Runtime (this may take a moment)..."
     ExecWait '"$TEMP\MicrosoftEdgeWebview2Setup.exe" /silent /install' $0
-    DetailPrint "WebView2 installer exited with code $0"
     Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+    ${If} $0 != 0
+      DetailPrint "WebView2 installer exited with code $0"
+      MessageBox MB_OK|MB_ICONEXCLAMATION \
+        "WebView2 Runtime installation may have failed (exit code: $0).$\n$\n\
+CoPaw Desktop requires WebView2 to display properly.$\n\
+If it does not work, please install manually:$\n\
+https://developer.microsoft.com/en-us/microsoft-edge/webview2/"
+    ${Else}
+      DetailPrint "WebView2 Runtime installed successfully."
+    ${EndIf}
   ${Else}
+    Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
     MessageBox MB_OK|MB_ICONEXCLAMATION \
-      "Could not download WebView2 Runtime (network error).$\n$\n\
+      "Could not download WebView2 Runtime ($0).$\n$\n\
 CoPaw Desktop requires WebView2 to display properly.$\n\
 Please install it manually after setup:$\n\
 https://developer.microsoft.com/en-us/microsoft-edge/webview2/"
