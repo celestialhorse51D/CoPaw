@@ -3,10 +3,15 @@
 ; Usage: makensis /DCOPAW_VERSION=1.2.3 /DOUTPUT_EXE=dist\CoPaw-Setup-1.2.3.exe scripts\pack\copaw_desktop.nsi
 
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 !define MUI_ABORTWARNING
 ; Use custom icon from unpacked env (copied by build_win.ps1)
 !define MUI_ICON "${UNPACKED}\icon.ico"
 !define MUI_UNICON "${UNPACKED}\icon.ico"
+
+; WebView2 Runtime detection — same GUID used by desktop_cmd.py
+!define WEBVIEW2_GUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+!define WEBVIEW2_BOOTSTRAPPER_URL "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 !ifndef COPAW_VERSION
   !define COPAW_VERSION "0.0.0"
@@ -32,6 +37,62 @@ RequestExecutionLevel user
 !ifndef UNPACKED
   !define UNPACKED "dist\win-unpacked"
 !endif
+
+; ---------------------------------------------------------------------------
+; WebView2 Runtime: detect via registry, download + install if missing.
+; The bootstrapper (~1.8 MB) supports per-user install — no admin needed.
+; ---------------------------------------------------------------------------
+Function _DetectWebView2
+  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    StrCpy $1 "1"
+    Return
+  ${EndIf}
+
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    StrCpy $1 "1"
+    Return
+  ${EndIf}
+
+  ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\${WEBVIEW2_GUID}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    StrCpy $1 "1"
+    Return
+  ${EndIf}
+
+  StrCpy $1 "0"
+FunctionEnd
+
+; Hidden section (runs automatically, not shown in component list)
+Section "-WebView2"
+  Call _DetectWebView2
+  ${If} $1 == "1"
+    DetailPrint "WebView2 Runtime already installed ($0), skipping."
+    Goto webview2_done
+  ${EndIf}
+
+  DetailPrint "WebView2 Runtime not found, downloading bootstrapper..."
+  NSISdl::download "${WEBVIEW2_BOOTSTRAPPER_URL}" "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+  Pop $0
+  ${If} $0 == "success"
+    DetailPrint "Installing WebView2 Runtime (this may take a moment)..."
+    ExecWait '"$TEMP\MicrosoftEdgeWebview2Setup.exe" /silent /install' $0
+    DetailPrint "WebView2 installer exited with code $0"
+    Delete "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+  ${Else}
+    MessageBox MB_OK|MB_ICONEXCLAMATION \
+      "Could not download WebView2 Runtime (network error).$\n$\n\
+CoPaw Desktop requires WebView2 to display properly.$\n\
+Please install it manually after setup:$\n\
+https://developer.microsoft.com/en-us/microsoft-edge/webview2/"
+  ${EndIf}
+
+  webview2_done:
+SectionEnd
 
 Section "CoPaw Desktop" SEC01
   SetOutPath "$INSTDIR"
