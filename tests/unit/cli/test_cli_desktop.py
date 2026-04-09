@@ -1,5 +1,5 @@
-# pylint: disable=protected-access
 # -*- coding: utf-8 -*-
+# pylint: disable=protected-access
 from __future__ import annotations
 
 import pytest
