@@ -9,7 +9,7 @@ on:
       target_ref:
         description: 'Branch or Commit to build (e.g., feat/installer-webview2-auto-install)'
         required: true
-        default: 'feat/installer-webview2-auto-install'
+        default: 'pr-test'
         type: string
       upload_to_oss:
         description: 'Upload to OSS'
