@@ -1,0 +1,95 @@
+# Manual Build CoPaw Desktop: Windows
+# Used for testing specific PR branches manually
+
+name: Manual CoPaw Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: 'Branch or Commit to build (e.g., feat/installer-webview2-auto-install)'
+        required: true
+        default: 'feat/installer-webview2-auto-install'
+        type: string
+      upload_to_oss:
+        description: 'Upload to OSS'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # 关键修改：使用手动输入的分支名进行检出
+          ref: ${{ inputs.target_ref }}
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content src/copaw/__version__.py -Raw
+          if ($content -match '__version__\s*=\s*"([^"]+)"') {
+            $v = $Matches[1]
+          } else {
+            throw "Failed to extract version from __version__.py"
+          }
+          "version<<EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $v | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: console/package-lock.json
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          python-version: "3.10"
+          activate-environment: "copaw-build"
+          condarc-file: .github/condarc
+          conda-remove-defaults: false
+
+      - name: Install NSIS
+        uses: negrutiu/nsis-install@v2
+
+      - name: Clean dist directory
+        shell: pwsh
+        run: |
+          if (Test-Path dist) {
+            Remove-Item -Recurse -Force dist
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: conda run -n copaw-build pwsh -File ./scripts/pack/build_win.ps1
+
+      - name: List dist (on failure)
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "=== dist contents ==="
+          Get-ChildItem -Path dist -Recurse -Depth 2 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          if (Test-Path dist\win-unpacked) {
+            Write-Host "=== dist\win-unpacked (first 30) ==="
+            Get-ChildItem -Path dist\win-unpacked -ErrorAction SilentlyContinue | Select-Object -First 30 | ForEach-Object { $_.Name }
+          }
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 关键修改：产物名称增加 TEST 标记，方便区分
+          name: CoPaw-Desktop-Windows-${{ steps.version.outputs.version }}-TEST
+          path: dist/CoPaw-Setup-*.exe
