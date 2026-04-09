@@ -137,8 +137,12 @@ def _find_windows_wrapper_ancestor_pids(pids: set[int]) -> set[int]:
                 break
 
             parent_pid = info[0]
-            if parent_pid in (None, 0) or parent_pid in visited:
+
+            # 修复点：显式检查 parent_pid 是否为 None
+            if parent_pid is None or parent_pid == 0 or parent_pid in visited:
                 break
+
+            # 此时 parent_pid 必定是 int 类型，可以安全添加到 visited
             visited.add(parent_pid)
 
             parent_info = snapshot.get(parent_pid)
