@@ -49,11 +49,13 @@ from ..utils import file_url_to_local_path
 from .constants import (
     FEISHU_FILE_MAX_BYTES,
     FEISHU_NICKNAME_CACHE_MAX,
-    FEISHU_PROCESSED_IDS_MAX,
     FEISHU_STALE_MSG_THRESHOLD_MS,
     FEISHU_WS_BACKOFF_FACTOR,
     FEISHU_WS_INITIAL_RETRY_DELAY,
     FEISHU_WS_MAX_RETRY_DELAY,
+    FEISHU_DEDUP_TTL_SECONDS,
+    FEISHU_DEDUP_CACHE_MAX,
+    FEISHU_DEDUP_FILE,
 )
 from .utils import (
     build_interactive_content_chunks,
@@ -125,6 +127,7 @@ try:
         CreateMessageRequestBody,
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
+        DeleteMessageReactionRequest,
         Emoji,
         GetMessageRequest,
         GetMessageResourceRequest,
@@ -144,6 +147,7 @@ except ImportError:  # pragma: no cover - optional dependency may be missing
     CreateMessageRequestBody = None  # type: ignore[assignment]
     CreateMessageReactionRequest = None  # type: ignore[assignment]
     CreateMessageReactionRequestBody = None  # type: ignore[assignment]
+    DeleteMessageReactionRequest = None  # type: ignore[assignment]
     Emoji = None  # type: ignore[assignment]
     GetMessageRequest = None  # type: ignore[assignment]
     GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -168,6 +172,10 @@ if TYPE_CHECKING:
     from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
 
 logger = logging.getLogger(__name__)
+
+# Processing status reactions
+_REACTION_IN_PROGRESS = "Typing"
+_REACTION_FAILURE = "CrossMark"
 
 
 class FeishuChannel(BaseChannel):
@@ -247,8 +255,21 @@ class FeishuChannel(BaseChannel):
 
         self._bot_open_id: Optional[str] = None
 
-        # message_id dedup (ordered, trim when over limit)
-        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
+        # Persistent message-id dedup (OrderedDict preserves insertion
+        # order for O(1) oldest-eviction; values are timestamps).
+        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
+        self._dedup_lock = asyncio.Lock()
+        self._dedup_file = (
+            Path(
+                self._workspace_dir or get_config_path().parent,
+            )
+            / FEISHU_DEDUP_FILE
+        )
+
+        # Reaction lifecycle cache
+        self._pending_reactions: Dict[str, str] = {}
+        self._reaction_lock = asyncio.Lock()
+
         # session_id -> (receive_id, receive_id_type) for send
         self._receive_id_store: Dict[str, Tuple[str, str]] = {}
         self._receive_id_lock = asyncio.Lock()
@@ -621,11 +642,10 @@ class FeishuChannel(BaseChannel):
 
             message_id = getattr(message, "message_id", None) or ""
             message_id = str(message_id).strip()
-            if message_id in self._processed_message_ids:
+
+            # Persistent dedup
+            if await self._is_duplicate(message_id):
                 return
-            self._processed_message_ids[message_id] = None
-            while len(self._processed_message_ids) > FEISHU_PROCESSED_IDS_MAX:
-                self._processed_message_ids.popitem(last=False)
 
             sender_type = getattr(sender, "sender_type", "") or ""
             if sender_type == "bot":
@@ -890,7 +910,8 @@ class FeishuChannel(BaseChannel):
             if not self._check_group_mention(is_group, meta):
                 return
 
-            await self._add_reaction(message_id, "Typing")
+            # Start processing reaction (Typing) BEFORE enqueue
+            asyncio.ensure_future(self._start_processing_reaction(message_id))
 
             session_id = self.resolve_session_id(sender_id, meta)
             native = {
@@ -914,14 +935,100 @@ class FeishuChannel(BaseChannel):
         except Exception:
             logger.exception("feishu _on_message failed")
 
+    # ------------------------------------------------------------------
+    # Persistent dedup helpers
+    # ------------------------------------------------------------------
+
+    async def _load_seen_message_ids(self) -> None:
+        """Load persisted dedup state on startup."""
+        try:
+            raw = await asyncio.to_thread(
+                self._dedup_file.read_text,
+                encoding="utf-8",
+            )
+            data = json.loads(raw)
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            return
+        now = time.time()
+        valid: Dict[str, float] = {}
+        for mid, ts in data.items():
+            if not isinstance(mid, str):
+                continue
+            try:
+                seen_at = float(ts)
+            except (ValueError, TypeError):
+                continue
+            if now - seen_at < FEISHU_DEDUP_TTL_SECONDS:
+                valid[mid] = seen_at
+        # Keep newest entries up to cache limit, oldest-first.
+        sorted_ids = sorted(
+            valid,
+            key=lambda k: valid[k],
+        )[-FEISHU_DEDUP_CACHE_MAX:]
+        async with self._dedup_lock:
+            self._seen_message_ids = OrderedDict(
+                (mid, valid[mid]) for mid in sorted_ids
+            )
+
+    async def _persist_seen_message_ids(self) -> None:
+        """Write current dedup state to disk (atomic)."""
+        async with self._dedup_lock:
+            snapshot = dict(self._seen_message_ids)
+        tmp_path = self._dedup_file.with_suffix(".tmp")
+        try:
+            self._dedup_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            content = json.dumps(
+                snapshot,
+                ensure_ascii=False,
+            )
+            await asyncio.to_thread(
+                tmp_path.write_text,
+                content,
+                encoding="utf-8",
+            )
+            await asyncio.to_thread(
+                tmp_path.replace,
+                self._dedup_file,
+            )
+        except OSError:
+            logger.debug(
+                "feishu persist dedup to %s failed",
+                self._dedup_file,
+                exc_info=True,
+            )
+
+    async def _is_duplicate(self, message_id: str) -> bool:
+        """Check and record message dedup with TTL."""
+        now = time.time()
+        async with self._dedup_lock:
+            if message_id in self._seen_message_ids:
+                seen_at = self._seen_message_ids[message_id]
+                if now - seen_at < FEISHU_DEDUP_TTL_SECONDS:
+                    return True
+                # Expired — remove and re-record below.
+                del self._seen_message_ids[message_id]
+            self._seen_message_ids[message_id] = now
+            # Evict oldest entries beyond cache limit.
+            while len(self._seen_message_ids) > FEISHU_DEDUP_CACHE_MAX:
+                self._seen_message_ids.popitem(last=False)
+        asyncio.create_task(self._persist_seen_message_ids())
+        return False
+
     async def _add_reaction(
         self,
         message_id: str,
         emoji_type: str = "THUMBSUP",
-    ) -> None:
-        """Add reaction to message (non-blocking)."""
+    ) -> Optional[str]:
+        """Add reaction and return reaction_id (or None)."""
         if not self._client:
-            return
+            return None
         try:
             req = (
                 CreateMessageReactionRequest.builder()
@@ -942,8 +1049,69 @@ class FeishuChannel(BaseChannel):
                     getattr(resp, "code", ""),
                     getattr(resp, "msg", ""),
                 )
+                return None
+            data = getattr(resp, "data", None)
+            return getattr(data, "reaction_id", None)
         except Exception as e:
             logger.debug("feishu reaction error: %s", e)
+            return None
+
+    async def _remove_reaction(
+        self,
+        message_id: str,
+        reaction_id: str,
+    ) -> bool:
+        """Remove a specific reaction. Returns True on success."""
+        if not self._client or not message_id or not reaction_id:
+            return False
+        try:
+            req = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            resp = await self._client.im.v1.message_reaction.delete(req)
+            if not resp.success():
+                logger.debug(
+                    "feishu reaction del failed code=%s msg=%s",
+                    getattr(resp, "code", ""),
+                    getattr(resp, "msg", ""),
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.debug("feishu reaction del error: %s", e)
+            return False
+
+    async def _start_processing_reaction(
+        self,
+        message_id: str,
+    ) -> None:
+        """Add Typing reaction and cache reaction_id."""
+        reaction_id = await self._add_reaction(
+            message_id,
+            _REACTION_IN_PROGRESS,
+        )
+        if reaction_id:
+            async with self._reaction_lock:
+                self._pending_reactions[message_id] = reaction_id
+
+    async def _finish_processing_reaction(
+        self,
+        message_id: str,
+        success: bool,
+    ) -> None:
+        """Remove Typing; add CrossMark on failure regardless."""
+        async with self._reaction_lock:
+            reaction_id = self._pending_reactions.pop(
+                message_id,
+                None,
+            )
+        if reaction_id:
+            await self._remove_reaction(message_id, reaction_id)
+        if not success:
+            await self._add_reaction(message_id, _REACTION_FAILURE)
 
     async def _download_image_resource(
         self,
@@ -1917,6 +2085,14 @@ class FeishuChannel(BaseChannel):
                     last_message_id = msg_id
         if last_message_id and meta is not None:
             meta["_last_sent_message_id"] = last_message_id
+
+        # Finalise processing reaction for the original user message
+        if meta and "feishu_message_id" in meta:
+            await self._finish_processing_reaction(
+                meta["feishu_message_id"],
+                last_message_id is not None,
+            )
+
         return last_message_id
 
     async def _on_process_completed(
@@ -1929,6 +2105,58 @@ class FeishuChannel(BaseChannel):
         last_msg_id = send_meta.get("_last_sent_message_id")
         if last_msg_id:
             await self._add_reaction(last_msg_id, "DONE")
+
+    async def _on_consume_error(
+        self,
+        request: Any,
+        to_handle: str,
+        err_text: str,
+    ) -> None:
+        """Clean up Typing reaction on error, then send error."""
+        await self._cleanup_pending_reaction(request)
+        await super()._on_consume_error(
+            request,
+            to_handle,
+            err_text,
+        )
+
+    async def _cleanup_pending_reaction(
+        self,
+        request: Any,
+    ) -> None:
+        """Best-effort cleanup of Typing reaction for *request*.
+
+        Tries ``channel_meta.feishu_message_id`` first; falls back to
+        scanning ``_pending_reactions`` by session so that Typing is
+        cleaned even when meta is missing or CancelledError fires.
+        """
+        meta = getattr(request, "channel_meta", None) or {}
+        msg_id = meta.get("feishu_message_id")
+        if msg_id:
+            await self._finish_processing_reaction(
+                msg_id,
+                success=False,
+            )
+            return
+        # Fallback: clear all pending reactions (rare path).
+        async with self._reaction_lock:
+            pending = dict(self._pending_reactions)
+            self._pending_reactions.clear()
+        for mid, rid in pending.items():
+            await self._remove_reaction(mid, rid)
+            await self._add_reaction(mid, _REACTION_FAILURE)
+
+    async def _consume_with_tracker(
+        self,
+        request: Any,
+        payload: Any,
+    ) -> None:
+        """Wrap base to clean up Typing on cancellation."""
+        try:
+            await super()._consume_with_tracker(request, payload)
+        except asyncio.CancelledError:
+            await self._cleanup_pending_reaction(request)
+            raise
 
     # ------------------------------------------------------------------
     # Interactive cards (tool_guard approval, etc.)
@@ -2224,6 +2452,7 @@ class FeishuChannel(BaseChannel):
             return
         self._closed = False
         self._load_receive_id_store_from_disk()
+        await self._load_seen_message_ids()
         if lark is None:
             raise ChannelError(
                 channel_name="feishu",

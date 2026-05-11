@@ -26,3 +26,12 @@ FEISHU_STALE_MSG_THRESHOLD_MS = 20 * 1000
 FEISHU_WS_INITIAL_RETRY_DELAY = 1.0  # seconds
 FEISHU_WS_MAX_RETRY_DELAY = 60.0  # seconds
 FEISHU_WS_BACKOFF_FACTOR = 2
+
+# Persistent dedup TTL in seconds (24 hours)
+FEISHU_DEDUP_TTL_SECONDS = 24 * 60 * 60
+
+# Max in-memory dedup entries
+FEISHU_DEDUP_CACHE_MAX = 2048
+
+# Dedup persistence file name
+FEISHU_DEDUP_FILE = "feishu_seen_message_ids.json"
