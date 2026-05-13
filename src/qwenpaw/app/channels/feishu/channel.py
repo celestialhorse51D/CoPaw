@@ -49,7 +49,6 @@ from ..utils import file_url_to_local_path
 from .constants import (
     FEISHU_FILE_MAX_BYTES,
     FEISHU_NICKNAME_CACHE_MAX,
-    FEISHU_PROCESSED_IDS_MAX,
     FEISHU_STALE_MSG_THRESHOLD_MS,
     FEISHU_WS_BACKOFF_FACTOR,
     FEISHU_WS_INITIAL_RETRY_DELAY,
