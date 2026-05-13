@@ -49,10 +49,12 @@ from ..utils import file_url_to_local_path
 from .constants import (
     FEISHU_FILE_MAX_BYTES,
     FEISHU_NICKNAME_CACHE_MAX,
+    FEISHU_PROCESSED_IDS_MAX,
     FEISHU_STALE_MSG_THRESHOLD_MS,
     FEISHU_WS_BACKOFF_FACTOR,
     FEISHU_WS_INITIAL_RETRY_DELAY,
     FEISHU_WS_MAX_RETRY_DELAY,
+    FEISHU_WS_RECV_TIMEOUT,
     FEISHU_DEDUP_TTL_SECONDS,
     FEISHU_DEDUP_CACHE_MAX,
     FEISHU_DEDUP_FILE,
@@ -252,6 +254,9 @@ class FeishuChannel(BaseChannel):
         self._http_client: Any = None
         # Clock offset (ms) = server_time - local_time
         self._clock_offset: int = 0
+        # Last time data was received on the WS; used to detect silent
+        # connection loss (TCP half-dead / NAT timeout).
+        self._last_ws_recv_time: float = 0.0
 
         self._bot_open_id: Optional[str] = None
 
@@ -1578,6 +1583,8 @@ class FeishuChannel(BaseChannel):
             file_type = "doc" if ext == "docx" else ext
             file_type = "xls" if ext == "xlsx" else file_type
             file_type = "ppt" if ext == "pptx" else file_type
+        elif ext in ("ogg", "opus"):
+            file_type = "opus"
         file_obj = None
         try:
             file_obj = await asyncio.to_thread(path.open, "rb")
@@ -1899,10 +1906,12 @@ class FeishuChannel(BaseChannel):
             file_key[:24] if file_key else "",
         )
         content = json.dumps({"file_key": file_key}, ensure_ascii=False)
+        ext = Path(path_or_url).suffix.lower().lstrip(".")
+        msg_type = "audio" if ext in ("ogg", "opus") else "file"
         return await self._send_message(
             receive_id_type,
             receive_id,
-            "file",
+            msg_type,
             content,
         )
 
@@ -2280,6 +2289,16 @@ class FeishuChannel(BaseChannel):
                     ),
                 )
 
+                # Patch SDK to track last-received timestamp for
+                # silent connection loss detection.
+                original_handle = self._ws_client._handle_message
+
+                async def _patched_handle_message(msg: bytes) -> None:
+                    self._last_ws_recv_time = time.time()
+                    return await original_handle(msg)
+
+                self._ws_client._handle_message = _patched_handle_message
+
                 async def _select() -> None:
                     while True:
                         await asyncio.sleep(3600)
@@ -2301,6 +2320,22 @@ class FeishuChannel(BaseChannel):
                             if self._ws_loop and not self._ws_loop.is_closed():
                                 self._ws_loop.stop()
                             break
+                        # No pong/data for too long → connection dead.
+                        last_recv = self._last_ws_recv_time
+                        if last_recv > 0:
+                            silent_seconds = time.time() - last_recv
+                            if silent_seconds > FEISHU_WS_RECV_TIMEOUT:
+                                logger.warning(
+                                    "feishu WebSocket no data received "
+                                    "for %.0fs, forcing reconnect...",
+                                    silent_seconds,
+                                )
+                                if (
+                                    self._ws_loop
+                                    and not self._ws_loop.is_closed()
+                                ):
+                                    self._ws_loop.stop()
+                                break
 
                 async def _drive_connection() -> None:
                     nonlocal connection_started
